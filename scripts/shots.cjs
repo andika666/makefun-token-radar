@@ -37,15 +37,15 @@ const fs = require('fs');
   const earlyFirst = await page.locator('tbody tr').first().locator('b').first().textContent();
   console.log('early rows rendered:', earlyRows, '| first:', earlyFirst);
   await page.screenshot({ path: path.join(out, '3-filtered.png'), type: 'png' });
-  // Sandbox smoke check: growth weight 0.5 -> 1.0 must move the ranking.
+  // Sandbox smoke check: growth weight 1.0 -> 2.0 must move the ranking.
   await page.getByRole('button', { name: 'Model & method' }).click();
   await page.waitForTimeout(300);
   const before = await page.locator('.sandbox-results p').first().textContent();
-  await page.locator('.slider-row input[type="range"]').nth(1).fill('1');
+  await page.locator('.slider-row input[type="range"]').nth(1).fill('2');
   await page.waitForTimeout(300);
   const after = await page.locator('.sandbox-results p').first().textContent();
   const sandboxTop = await page.locator('.sandbox-results tbody tr').first().locator('b').textContent();
-  console.log('sandbox before:', before, '| after growth weight 1.0:', after, '| sandbox top 1:', sandboxTop);
+  console.log('sandbox before:', before, '| after growth weight 2.0:', after, '| sandbox top 1:', sandboxTop);
   console.log('console errors:', errors.length ? errors : 'none');
   await browser.close();
   for (const n of ['1-board.png', '2-detail.png', '3-filtered.png']) {

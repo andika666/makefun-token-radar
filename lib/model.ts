@@ -1,4 +1,4 @@
-// The token radar's model, version radar-2: one snapshot of the protocol universe in, one ranked
+// The token radar's model, version radar-3: one snapshot of the protocol universe in, one ranked
 // board out.
 //
 // The board covers every slug in the snapshot's watchlist (the floor, never a ceiling) and every
@@ -16,24 +16,33 @@
 // a small liquid-staking or bridge protocol can still launch a governance token of its own, and
 // the discount says its launch is worth less because the underlying already trades.
 //
-// Implied value follows only from the snapshot's own figures:
+// Implied value is calibrated on the snapshot's own live tokens, never on a hardcoded multiple:
 //
-//   base       = tvl_usd x BASE_MULTIPLE
-//   growth     = clamp(change_7d, -60, 120) per cent
-//   growthMult = 1 + (growth / 100) x GROWTH_WEIGHT
-//   maturity   = 0.6 + min(age_days, 1095) / 1095 x 0.4   (age_days unknown: 365)
-//   chainMult  = 1 + 0.05 x min(chains - 1, 4)            (distribution breadth)
-//   category   = the category factor below               (what kind of token it could launch)
-//   implied    = max(1, round(base x growthMult x maturity x chainMult x category))
+//   comps    = the market-cap / TVL ratio of every live-token protocol in the snapshot
+//              (market cap present and positive, TVL positive, not an exchange),
+//              winsorized to [0.02, 5] so one outlier cannot set the price
+//   multiple = the per-category median ratio where the category has 5 or more live comps,
+//              else the global median ratio across all live comps
+//   discount = 1.0 where the category median is used (the market already priced the kind);
+//              where the global median is used instead, the category table still applies:
+//              a receipt token 0.6x, a stablecoin token 0.7x, a curator token 0.85x
+//   growth   = clamp(change_7d, -50, 150) per cent
+//   growthMult = 1 + (growth / 100) x 1.0              (spans 0.5 to 2.5)
+//   maturity = 0.5 + min(age_days, 1095) / 1095 x 0.8  (spans 0.5 to 1.3; unknown age: 365)
+//   chainMult  = 1 + 0.05 x min(chains - 1, 4)         (distribution breadth)
+//   implied  = max(1, round(tvl_usd x multiple x growthMult x maturity x chainMult x discount))
 //
-// The category factor is a category-level prior, never a list of names: a receipt token (a bridge
-// or liquid-staking receipt) is worth less than a core protocol's token because the asset it
-// wraps already trades; a vault curator's token is worth a little less than a core protocol's
-// because the curator earns fees on other protocols' pools; a stablecoin's token is worth less
-// because the stable asset itself carries the value. Every other category scores 1.0.
+// No protocol name is ever special-cased: the same function scores every row, and the multiple
+// comes from the snapshot's own live tokens. The calibration is checked blind: the live tokens
+// are split by a deterministic hash of the slug (80% fit, 20% test), the comps curve is fitted
+// on the fit set only, and the test set's market caps are predicted from TVL x the category
+// multiple. The dashboard states the result: the median absolute error and the share of
+// predictions within twice the true market cap. A multiple is a market anchor for ranking, not
+// a price prediction: across live tokens the market-cap / TVL ratio spans 0.0003 to 400, so any
+// TVL-only multiple is rough, and the blind check says how rough.
 //
-// The constants are the radar-2 model's, stated in the dashboard and changeable in the model
-// sandbox. No protocol name is ever special-cased: the same function scores every row.
+// The constants are the radar-3 model's, stated in the dashboard and changeable in the model
+// sandbox. The multiples are not constants: they are computed from the snapshot on every run.
 
 /** The snapshot's protocol entry: exactly the ten fields the sealed input carries. */
 export interface SnapshotProtocol {
@@ -60,7 +69,6 @@ export interface Snapshot {
 
 /** The model's constants, as the dashboard states them and the sandbox may change them. */
 export interface ModelConstants {
-  base_multiple: number;
   growth_weight: number;
   growth_floor: number;
   growth_cap: number;
@@ -70,23 +78,28 @@ export interface ModelConstants {
   unknown_age_days: number;
   chain_step: number;
   chain_max_steps: number;
+  winsor_low: number;
+  winsor_high: number;
+  min_category_comps: number;
 }
 
 export const MODEL: ModelConstants = {
-  base_multiple: 0.25,
-  growth_weight: 0.5,
-  growth_floor: -60,
-  growth_cap: 120,
-  maturity_floor: 0.6,
-  maturity_range: 0.4,
+  growth_weight: 1.0,
+  growth_floor: -50,
+  growth_cap: 150,
+  maturity_floor: 0.5,
+  maturity_range: 0.8,
   maturity_days: 1095,
   unknown_age_days: 365,
   chain_step: 0.05,
   chain_max_steps: 4,
+  winsor_low: 0.02,
+  winsor_high: 5,
+  min_category_comps: 5,
 };
 
 /** The model's version label: the dashboard names it and the rules quote it. */
-export const MODEL_VERSION = 'radar-2';
+export const MODEL_VERSION = 'radar-3';
 
 /** How many live-token protocols the Live token view carries, by market cap. */
 export const LIVE_ROWS = 24;
@@ -96,6 +109,14 @@ export interface FarmStep {
   text: string;
   cost: string;
   time: string;
+}
+
+/** One protocol's farm budget for setting the plan up: capital plus gas, from the same helpers. */
+export interface FarmBudget {
+  capital_usd: number;
+  gas_usd: number;
+  total_usd: number;
+  chain: string;
 }
 
 /** One row of board.json: the ranked board's row. */
@@ -116,7 +137,8 @@ export interface BoardRow {
   age_days: number | null;
   implied_value_usd: number;
   model: {
-    base_multiple: number;
+    comps_multiple: number;
+    comps_source: string;
     growth_pct: number;
     growth_multiplier: number;
     maturity_multiplier: number;
@@ -126,6 +148,7 @@ export interface BoardRow {
     age_days: number | null;
   };
   farm_steps: string[];
+  farm_budget: FarmBudget;
 }
 
 /** The dashboard's compact view of one row, with farm plans generated in the page. */
@@ -142,11 +165,14 @@ export interface RadarRow {
   watchlist: boolean;
   age_days: number | null;
   implied_value_usd: number;
+  comps_multiple: number;
+  comps_source: string;
   growth_multiplier: number;
   maturity_multiplier: number;
   chain_multiplier: number;
   category_multiplier: number;
   category_factor: string;
+  farm_budget: FarmBudget;
 }
 
 /** A live-token protocol: it already trades, so the board shows the market's own value, not a model's. */
@@ -160,7 +186,23 @@ export interface LiveRow {
   change_7d: number | null;
 }
 
-/** Everything the dashboard needs: the board, the live set, and the model it runs. */
+/** One category's comps: its median market-cap / TVL ratio and how many live tokens set it. */
+export interface CompsCategory {
+  category: string;
+  median: number;
+  count: number;
+}
+
+/** The blind check's result: the comps curve fitted on one set, tested on the held-out set. */
+export interface BlindValidation {
+  fit_count: number;
+  test_count: number;
+  median_abs_pct_error: number;
+  within_2x_count: number;
+  within_2x_share: number;
+}
+
+/** Everything the dashboard needs: the board, the live set, the comps and the blind check. */
 export interface RadarData {
   as_of: string;
   source: string;
@@ -171,6 +213,10 @@ export interface RadarData {
   board_size: number;
   early_size: number;
   live_size: number;
+  comps_global_median: number;
+  comps_live_count: number;
+  comps_categories: CompsCategory[];
+  validation: BlindValidation;
   rows: RadarRow[];
   live: LiveRow[];
 }
@@ -199,9 +245,20 @@ export function ageDays(asOf: string, listedAt: string | null): number | null {
   return Math.max(0, Math.floor((a - b) / DAY_MS));
 }
 
+/** The median of a list of numbers; 0 for an empty list. */
+function median(values: number[]): number {
+  const s = [...values].sort((a, b) => a - b);
+  const n = s.length;
+  if (n === 0) return 0;
+  if (n % 2 === 1) return s[(n - 1) / 2]!;
+  return (s[n / 2 - 1]! + s[n / 2]!) / 2;
+}
+
 /**
  * The category factor: what kind of token this protocol could launch, as a multiplier on the
- * implied value. A receipt token is worth less because the asset it wraps already trades; a
+ * implied value. It applies only where the comps table has too few live tokens of the category
+ * to price the kind itself; where the category median is used, the market already priced it and
+ * this factor is 1. A receipt token is worth less because the asset it wraps already trades; a
  * curator's token is worth a little less because the curator earns fees on other protocols'
  * pools; a stablecoin's token is worth less because the stable asset itself carries the value.
  * Every other category scores 1.0. Categories, never names: the same table scores every row.
@@ -233,10 +290,71 @@ export function chainMultiplier(chains: string[], model: ModelConstants): number
   return 1 + extra * model.chain_step;
 }
 
-/** The five multipliers and the implied value one protocol gets under `model`. */
+/** The live-token protocols the comps are calibrated on: a market cap that exists, a TVL above zero, not an exchange. */
+export function liveComps(snapshot: Snapshot): SnapshotProtocol[] {
+  return snapshot.protocols.filter(
+    (p) => p.mcap_usd !== null && p.mcap_usd > 0 && p.tvl_usd > 0 && p.category !== 'CEX',
+  );
+}
+
+/** The comps table: the global median ratio and one median per category. */
+export interface CompsTable {
+  global_median: number;
+  global_count: number;
+  by_category: Map<string, CompsCategory>;
+}
+
+export function buildCompsTable(live: SnapshotProtocol[], model: ModelConstants): CompsTable {
+  const winsor = (r: number): number => Math.min(model.winsor_high, Math.max(model.winsor_low, r));
+  const global_median = median(live.map((p) => winsor(p.mcap_usd! / p.tvl_usd)));
+  const groups = new Map<string, number[]>();
+  for (const p of live) {
+    const key = p.category ?? 'Other';
+    const arr = groups.get(key) ?? [];
+    arr.push(winsor(p.mcap_usd! / p.tvl_usd));
+    groups.set(key, arr);
+  }
+  const by_category = new Map<string, CompsCategory>();
+  for (const [category, ratios] of groups) {
+    by_category.set(category, { category, median: median(ratios), count: ratios.length });
+  }
+  return { global_median, global_count: live.length, by_category };
+}
+
+/**
+ * The multiple one category is priced at: its own median market-cap / TVL ratio where the
+ * category has enough live comps to price the kind, else the global median with the category
+ * factor still applied, because a thin category's kind is not priced by its own market yet.
+ */
+export function multipleFor(
+  category: string | null,
+  table: CompsTable,
+  model: ModelConstants,
+): { multiple: number; source: string; category_multiplier: number; category_factor: string } {
+  const key = category ?? 'Other';
+  const entry = table.by_category.get(key);
+  if (entry !== undefined && entry.count >= model.min_category_comps) {
+    return {
+      multiple: entry.median,
+      source: `${key} median (${entry.count} live)`,
+      category_multiplier: 1,
+      category_factor: 'comps-calibrated',
+    };
+  }
+  const { factor, label } = categoryFactor(category);
+  return {
+    multiple: table.global_median,
+    source: `global median (${table.global_count} live)`,
+    category_multiplier: factor,
+    category_factor: label,
+  };
+}
+
+/** The five factors and the implied value one protocol gets under `model` and `table`. */
 export function impliedValue(
   protocol: SnapshotProtocol,
   asOf: string,
+  table: CompsTable,
   model: ModelConstants,
 ): {
   implied: number;
@@ -244,6 +362,8 @@ export function impliedValue(
   growthMult: number;
   maturityMult: number;
   chainMult: number;
+  compsMultiple: number;
+  compsSource: string;
   categoryMult: number;
   categoryLabel: string;
   age: number | null;
@@ -257,10 +377,61 @@ export function impliedValue(
     model.maturity_floor +
     (Math.min(Math.max(ageForModel, 0), model.maturity_days) / model.maturity_days) * model.maturity_range;
   const chainMult = chainMultiplier(protocol.chains, model);
-  const { factor: categoryMult, label: categoryLabel } = categoryFactor(protocol.category);
-  const base = protocol.tvl_usd * model.base_multiple;
-  const implied = Math.max(1, Math.round(base * growthMult * maturityMult * chainMult * categoryMult));
-  return { implied, growthPct, growthMult, maturityMult, chainMult, categoryMult, categoryLabel, age };
+  const m = multipleFor(protocol.category, table, model);
+  const implied = Math.max(
+    1,
+    Math.round(protocol.tvl_usd * m.multiple * growthMult * maturityMult * chainMult * m.category_multiplier),
+  );
+  return {
+    implied,
+    growthPct,
+    growthMult,
+    maturityMult,
+    chainMult,
+    compsMultiple: m.multiple,
+    compsSource: m.source,
+    categoryMult: m.category_multiplier,
+    categoryLabel: m.category_factor,
+    age,
+  };
+}
+
+/** A deterministic split of a string into [0, 1): FNV-1a, never random at runtime. */
+function slugHash(slug: string): number {
+  let h = 2166136261;
+  for (let i = 0; i < slug.length; i++) {
+    h ^= slug.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return (h >>> 0) / 4294967296;
+}
+
+/**
+ * The blind check: the live comps are split by slug hash (80% fit, 20% test), the comps curve
+ * is fitted on the fit set only, and each test protocol's market cap is predicted from its TVL
+ * times the category multiple the fit set gives it. The median absolute error and the share of
+ * predictions within twice the true market cap are the check's result.
+ */
+export function blindValidation(live: SnapshotProtocol[], model: ModelConstants): BlindValidation {
+  const fit = live.filter((p) => slugHash(p.slug) < 0.8);
+  const test = live.filter((p) => slugHash(p.slug) >= 0.8);
+  const fitTable = buildCompsTable(fit, model);
+  const errors: number[] = [];
+  let within = 0;
+  for (const p of test) {
+    const m = multipleFor(p.category, fitTable, model);
+    const predicted = p.tvl_usd * m.multiple * m.category_multiplier;
+    const actual = p.mcap_usd!;
+    errors.push((Math.abs(predicted - actual) / actual) * 100);
+    if (predicted / actual >= 0.5 && predicted / actual <= 2) within++;
+  }
+  return {
+    fit_count: fit.length,
+    test_count: test.length,
+    median_abs_pct_error: errors.length > 0 ? median(errors) : 0,
+    within_2x_count: within,
+    within_2x_share: test.length > 0 ? within / test.length : 0,
+  };
 }
 
 /** DefiLlama's version-marker rule: a name ending in a release is a pool of another protocol. */
@@ -290,7 +461,12 @@ export interface BoardSummary {
 }
 
 /** The protocols the board ranks, strongest first, with ranks 1..n. */
-export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): BoardRow[] {
+export function buildBoard(
+  snapshot: Snapshot,
+  model: ModelConstants = MODEL,
+  table?: CompsTable,
+): BoardRow[] {
+  const comps = table ?? buildCompsTable(liveComps(snapshot), model);
   const index = bySlug(snapshot.protocols);
   const chosen = new Map<string, SnapshotProtocol>();
   // The watchlist is the floor: every slug, even one the snapshot no longer carries (it cannot, but the
@@ -308,7 +484,7 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
   for (const p of early) chosen.set(p.slug, p);
 
   const scored = [...chosen.values()].map((p) => {
-    const v = impliedValue(p, snapshot.as_of, model);
+    const v = impliedValue(p, snapshot.as_of, comps, model);
     return { p, ...v };
   });
   scored.sort((a, b) => b.implied - a.implied || (a.p.slug < b.p.slug ? -1 : a.p.slug > b.p.slug ? 1 : 0));
@@ -330,7 +506,8 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
     age_days: s.age,
     implied_value_usd: s.implied,
     model: {
-      base_multiple: model.base_multiple,
+      comps_multiple: s.compsMultiple,
+      comps_source: s.compsSource,
       growth_pct: s.growthPct,
       growth_multiplier: round4(s.growthMult),
       maturity_multiplier: round4(s.maturityMult),
@@ -340,6 +517,7 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
       age_days: s.age,
     },
     farm_steps: farmSteps(s.p, s.age).map(stepText),
+    farm_budget: farmBudget(s.p),
   }));
 }
 
@@ -366,12 +544,28 @@ export function gasFor(chain: string): string {
   return 'under $0.50 of gas';
 }
 
+/** The same gas in dollars, so the farm budget adds up: the words above, as numbers. */
+export function gasUsdFor(chain: string): number {
+  if (chain === 'Ethereum') return 5;
+  if (chain === 'Solana') return 0.1;
+  if (chain === 'Bitcoin' || chain === 'Hyperliquid L1') return 2;
+  return 0.5;
+}
+
 /** How much capital one farm position needs, from the protocol's own TVL. */
 function capitalFor(p: SnapshotProtocol): number {
   if (p.tvl_usd >= 5_000_000_000) return 250;
   if (p.tvl_usd >= 1_000_000_000) return 150;
   if (p.tvl_usd >= 100_000_000) return 100;
   return 50;
+}
+
+/** What setting the plan up costs: the capital plus gas for two transactions, the first funding and the main position. */
+export function farmBudget(p: SnapshotProtocol): FarmBudget {
+  const chain = chainOf(p);
+  const capital = capitalFor(p);
+  const gas = 2 * gasUsdFor(chain);
+  return { capital_usd: capital, gas_usd: gas, total_usd: capital + gas, chain };
 }
 
 /** How long to hold, from the protocol's age: younger protocols get a longer qualifying window. */
@@ -488,19 +682,28 @@ export function radarRow(row: BoardRow): RadarRow {
     watchlist: row.watchlist,
     age_days: row.age_days,
     implied_value_usd: row.implied_value_usd,
+    comps_multiple: row.model.comps_multiple,
+    comps_source: row.model.comps_source,
     growth_multiplier: row.model.growth_multiplier,
     maturity_multiplier: row.model.maturity_multiplier,
     chain_multiplier: row.model.chain_multiplier,
     category_multiplier: row.model.category_multiplier,
     category_factor: row.model.category_factor,
+    farm_budget: row.farm_budget,
   };
 }
 
 /** Everything the dashboard renders, from the snapshot. */
 export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): { board: BoardRow[]; radar: RadarData } {
-  const board = buildBoard(snapshot, model);
-  const live = liveRows(snapshot);
+  const live = liveComps(snapshot);
+  const table = buildCompsTable(live, model);
+  const validation = blindValidation(live, model);
+  const board = buildBoard(snapshot, model, table);
+  const liveList = liveRows(snapshot);
   const early = board.filter((r) => !snapshot.watchlist.includes(r.slug)).length;
+  const comps_categories = [...table.by_category.values()]
+    .filter((c) => c.count >= model.min_category_comps)
+    .sort((a, b) => b.count - a.count || (a.category < b.category ? -1 : a.category > b.category ? 1 : 0));
   const radar: RadarData = {
     as_of: snapshot.as_of,
     source: snapshot.source,
@@ -510,9 +713,13 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
     watchlist_size: snapshot.watchlist.length,
     board_size: board.length,
     early_size: early,
-    live_size: live.length,
+    live_size: liveList.length,
+    comps_global_median: table.global_median,
+    comps_live_count: table.global_count,
+    comps_categories,
+    validation,
     rows: board.map(radarRow),
-    live,
+    live: liveList,
   };
   return { board, radar };
 }

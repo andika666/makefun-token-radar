@@ -98,6 +98,13 @@ a { color: var(--accent); }
 .badge.wl { background: var(--accent-dim); color: var(--accent); }
 .badge.early { background: var(--blue-dim); color: var(--blue); }
 .note { color: var(--muted); margin-bottom: var(--step-3); max-width: 90ch; }
+.check {
+  background: var(--surface); border: 1px solid var(--border); border-left: 3px solid var(--accent);
+  border-radius: var(--radius-panel); padding: var(--step-3) var(--step-4); margin-bottom: var(--step-4);
+}
+.check p { font-size: 14px; line-height: 1.55; }
+.check b { font-weight: 600; }
+.check .sub { margin-left: var(--step-2); }
 
 .panel { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-panel); overflow: hidden; }
 .table-wrap { overflow-x: auto; }
@@ -160,6 +167,10 @@ table.cat th, table.cat td { border-bottom: 1px solid var(--border); }
 .steps li { padding-left: var(--step-1); }
 .steps b { display: block; font-weight: 500; }
 .cost { color: var(--muted); font-size: 12px; font-family: var(--font-num); }
+.budget { font-size: 14px; margin-bottom: var(--step-3); padding: var(--step-2) var(--step-3); background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--radius-control); }
+table.factors td, table.factors th { padding: var(--step-2) var(--step-3); }
+table.factors tr.total td { border-top: 1px solid var(--accent); border-bottom: 0; font-weight: 650; }
+table.factors tr.total td:first-child { color: var(--accent); }
 
 @media (max-width: 900px) {
   .shell { padding: var(--step-4); }
