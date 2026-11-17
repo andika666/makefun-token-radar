@@ -97,6 +97,12 @@ a { color: var(--accent); }
 .badge { font-family: var(--font-num); font-size: 10px; letter-spacing: 0.08em; padding: 3px 7px; border-radius: 999px; white-space: nowrap; }
 .badge.wl { background: var(--accent-dim); color: var(--accent); }
 .badge.early { background: var(--blue-dim); color: var(--blue); }
+.sigs { display: flex; gap: 6px; margin-top: 4px; flex-wrap: wrap; }
+.sig { font-family: var(--font-num); font-size: 10px; letter-spacing: 0.08em; padding: 2px 6px; border-radius: 999px; white-space: nowrap; background: var(--surface-2); color: var(--muted); border: 1px solid var(--border); }
+.sig.hot { background: var(--accent-dim); color: var(--accent); border-color: var(--accent); }
+.sig.cooling { background: #3a1d1d; color: #f08080; border-color: #5a2a2a; }
+.sig.new { background: var(--blue-dim); color: var(--blue); border-color: var(--blue); }
+.verdict { font-size: 13px; font-weight: 600; color: var(--accent); margin: 2px 0 0; }
 .note { color: var(--muted); margin-bottom: var(--step-3); max-width: 90ch; }
 .check {
   background: var(--surface); border: 1px solid var(--border); border-left: 3px solid var(--accent);

@@ -1,5 +1,7 @@
 // Token Radar's program: one sealed snapshot in, one ranked board, one dashboard and one
-// dossier out. Node 22, standard library only.
+// dossier out. Node 22, standard library only. Model radar-4 (lib/model.ts): the board is
+// ranked by a size curve fitted on the snapshot's own live tokens, with a verdict and signal
+// chips per row and a seven-step farm plan.
 //
 //   MAKEFUN_OUTPUT_DIR=out node main.ts --input <snapshot.json>
 //

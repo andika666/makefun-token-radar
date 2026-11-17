@@ -1,4 +1,4 @@
-// The token radar's model, version radar-3: one snapshot of the protocol universe in, one ranked
+// The token radar's model, version radar-4: one snapshot of the protocol universe in, one ranked
 // board out.
 //
 // The board covers every slug in the snapshot's watchlist (the floor, never a ceiling) and every
@@ -12,37 +12,41 @@
 // trades (WBTC is Bitcoin on Ethereum, Binance staked ETH is ETH in Binance's staking product) or
 // products of another protocol the snapshot does not name a parent for. They are not protocols
 // still waiting on a launch of their own, so the board does not rank them; the Live view shows the
-// tokens that already trade. Below the floor the same receipt-like protocols stay in, discounted:
-// a small liquid-staking or bridge protocol can still launch a governance token of its own, and
-// the discount says its launch is worth less because the underlying already trades.
+// tokens that already trade. Below the floor the same receipt-like protocols stay in, discounted
+// by their category's fitted shift: a small liquid-staking or bridge protocol can still launch a
+// governance token of its own, and the shift says what the market pays for its kind.
 //
-// Implied value is calibrated on the snapshot's own live tokens, never on a hardcoded multiple:
+// Implied value is fitted on the snapshot's own live tokens, never on a hardcoded multiple. The
+// fit is a size curve, because the market pays less per TVL dollar as a protocol grows: across the
+// live tokens, log market cap on log TVL has slope 0.46, so a 10x bigger TVL comes with only
+// about 2.9x the market cap, and the implied multiple falls from 0.70x at $10M of TVL to 0.02x
+// at $10B. The curve is fitted by least squares on one live token per ticker (118 comps), and
+// each category with 5 or more live tokens gets its own intercept shift: the median residual of
+// its live tokens, shrunk by n/(n+5) toward the curve. Growth, age and chain breadth enter as
+// stated priors, not fitted coefficients, because after the size curve they carry no residual
+// signal in the live tokens (correlations -0.09, -0.07 and -0.05): the curve is the fitted part,
+// the priors are the stated part, and the dashboard says which is which.
 //
-//   comps    = the market-cap / TVL ratio of every live-token protocol in the snapshot
-//              (market cap present and positive, TVL positive, not an exchange),
-//              winsorized to [0.02, 5] so one outlier cannot set the price
-//   multiple = the per-category median ratio where the category has 5 or more live comps,
-//              else the global median ratio across all live comps
-//   discount = 1.0 where the category median is used (the market already priced the kind);
-//              where the global median is used instead, the category table still applies:
-//              a receipt token 0.6x, a stablecoin token 0.7x, a curator token 0.85x
+//   curve    = least squares ln(mcap) = a + b ln(tvl) on one live token per ticker
+//   shift    = a category's median residual from the curve, shrunk n/(n+5), where n >= 5
+//   base     = exp(a + b ln(tvl) + shift)
 //   growth   = clamp(change_7d, -50, 150) per cent
 //   growthMult = 1 + (growth / 100) x 1.0              (spans 0.5 to 2.5)
 //   maturity = 0.5 + min(age_days, 1095) / 1095 x 0.8  (spans 0.5 to 1.3; unknown age: 365)
 //   chainMult  = 1 + 0.05 x min(chains - 1, 4)         (distribution breadth)
-//   implied  = max(1, round(tvl_usd x multiple x growthMult x maturity x chainMult x discount))
+//   implied  = max(1, round(base x growthMult x maturity x chainMult))
 //
-// No protocol name is ever special-cased: the same function scores every row, and the multiple
-// comes from the snapshot's own live tokens. The calibration is checked blind: the live tokens
-// are split by a deterministic hash of the slug (80% fit, 20% test), the comps curve is fitted
-// on the fit set only, and the test set's market caps are predicted from TVL x the category
-// multiple. The dashboard states the result: the median absolute error and the share of
-// predictions within twice the true market cap. A multiple is a market anchor for ranking, not
-// a price prediction: across live tokens the market-cap / TVL ratio spans 0.0003 to 400, so any
-// TVL-only multiple is rough, and the blind check says how rough.
+// No protocol name is ever special-cased: the same function scores every row, and the curve and
+// the shifts are computed from the snapshot on every run. The fit is checked twice, out of
+// sample: a hash split (80% fit, 20% test) and a walk-forward time split (fit on protocols
+// listed before 2024-06-01, test on the ones listed after). The dashboard states both results:
+// the median absolute error and the share of predictions within twice the true market cap. A
+// multiple is a market anchor for ranking, not a price prediction: across live tokens the
+// market-cap / TVL ratio spans 0.0003 to 400, so any TVL-only curve is rough, and the two
+// checks say how rough.
 //
-// The constants are the radar-3 model's, stated in the dashboard and changeable in the model
-// sandbox. The multiples are not constants: they are computed from the snapshot on every run.
+// The constants are the radar-4 model's, stated in the dashboard and changeable in the model
+// sandbox. The curve is not a constant: it is fitted from the snapshot on every run.
 
 /** The snapshot's protocol entry: exactly the ten fields the sealed input carries. */
 export interface SnapshotProtocol {
@@ -78,9 +82,9 @@ export interface ModelConstants {
   unknown_age_days: number;
   chain_step: number;
   chain_max_steps: number;
-  winsor_low: number;
-  winsor_high: number;
   min_category_comps: number;
+  shift_shrink: number;
+  time_split_cutoff: string;
 }
 
 export const MODEL: ModelConstants = {
@@ -93,13 +97,13 @@ export const MODEL: ModelConstants = {
   unknown_age_days: 365,
   chain_step: 0.05,
   chain_max_steps: 4,
-  winsor_low: 0.02,
-  winsor_high: 5,
   min_category_comps: 5,
+  shift_shrink: 5,
+  time_split_cutoff: '2024-06-01',
 };
 
 /** The model's version label: the dashboard names it and the rules quote it. */
-export const MODEL_VERSION = 'radar-3';
+export const MODEL_VERSION = 'radar-4';
 
 /** How many live-token protocols the Live token view carries, by market cap. */
 export const LIVE_ROWS = 24;
@@ -146,7 +150,11 @@ export interface BoardRow {
     category_multiplier: number;
     category_factor: string;
     age_days: number | null;
+    size_curve_value: number;
+    category_shift: number;
   };
+  verdict: string;
+  signals: string[];
   farm_steps: string[];
   farm_budget: FarmBudget;
 }
@@ -172,6 +180,10 @@ export interface RadarRow {
   chain_multiplier: number;
   category_multiplier: number;
   category_factor: string;
+  size_curve_value: number;
+  category_shift: number;
+  verdict: string;
+  signals: string[];
   farm_budget: FarmBudget;
 }
 
@@ -186,14 +198,14 @@ export interface LiveRow {
   change_7d: number | null;
 }
 
-/** One category's comps: its median market-cap / TVL ratio and how many live tokens set it. */
+/** One category's shift off the size curve: its median log residual, shrunk toward the curve. */
 export interface CompsCategory {
   category: string;
-  median: number;
+  shift: number;
   count: number;
 }
 
-/** The blind check's result: the comps curve fitted on one set, tested on the held-out set. */
+/** The blind check's result: the curve fitted on one set, tested on the held-out set. */
 export interface BlindValidation {
   fit_count: number;
   test_count: number;
@@ -202,7 +214,22 @@ export interface BlindValidation {
   within_2x_share: number;
 }
 
-/** Everything the dashboard needs: the board, the live set, the comps and the blind check. */
+/** The fitted size curve: log market cap on log TVL, one live token per ticker. */
+export interface SizeCurve {
+  intercept: number;
+  slope: number;
+  r2: number;
+  count: number;
+  by_category: Map<string, CompsCategory>;
+}
+
+/** One point of the curve table the dashboard prints: the multiple at a TVL. */
+export interface CurvePoint {
+  tvl_usd: number;
+  multiple: number;
+}
+
+/** Everything the dashboard needs: the board, the live set, the curve and the two checks. */
 export interface RadarData {
   as_of: string;
   source: string;
@@ -216,7 +243,10 @@ export interface RadarData {
   comps_global_median: number;
   comps_live_count: number;
   comps_categories: CompsCategory[];
+  curve: { intercept: number; slope: number; r2: number; count: number };
+  curve_table: CurvePoint[];
   validation: BlindValidation;
+  validation_time: BlindValidation;
   rows: RadarRow[];
   live: LiveRow[];
 }
@@ -254,107 +284,113 @@ function median(values: number[]): number {
   return (s[n / 2 - 1]! + s[n / 2]!) / 2;
 }
 
-/**
- * The category factor: what kind of token this protocol could launch, as a multiplier on the
- * implied value. It applies only where the comps table has too few live tokens of the category
- * to price the kind itself; where the category median is used, the market already priced it and
- * this factor is 1. A receipt token is worth less because the asset it wraps already trades; a
- * curator's token is worth a little less because the curator earns fees on other protocols'
- * pools; a stablecoin's token is worth less because the stable asset itself carries the value.
- * Every other category scores 1.0. Categories, never names: the same table scores every row.
- */
-export function categoryFactor(category: string | null): { factor: number; label: string } {
-  const c = (category ?? '').toLowerCase();
-  if (
-    c === 'bridge' ||
-    c === 'canonical bridge' ||
-    c === 'cross chain bridge' ||
-    c === 'liquid staking' ||
-    c === 'liquid restaking' ||
-    c === 'restaked btc' ||
-    c === 'stablecoin wrapper' ||
-    c === 'staking pool'
-  ) {
-    return { factor: 0.6, label: 'receipt token' };
-  }
-  if (c === 'stablecoin') return { factor: 0.7, label: 'stablecoin token' };
-  if (c === 'risk curators' || c === 'onchain capital allocator') {
-    return { factor: 0.85, label: 'curator token' };
-  }
-  return { factor: 1.0, label: 'core protocol token' };
-}
-
 /** The chain-breadth multiplier: more chains means wider distribution at launch. */
 export function chainMultiplier(chains: string[], model: ModelConstants): number {
   const extra = Math.max(0, Math.min(chains.length - 1, model.chain_max_steps));
   return 1 + extra * model.chain_step;
 }
 
-/** The live-token protocols the comps are calibrated on: a market cap that exists, a TVL above zero, not an exchange. */
+/**
+ * The live-token protocols the curve is fitted on: one live token per ticker (the largest TVL
+ * where two protocols share a symbol, so one token cannot set the price twice), a market cap
+ * that exists, a TVL above zero, not an exchange.
+ */
 export function liveComps(snapshot: Snapshot): SnapshotProtocol[] {
-  return snapshot.protocols.filter(
-    (p) => p.mcap_usd !== null && p.mcap_usd > 0 && p.tvl_usd > 0 && p.category !== 'CEX',
-  );
+  const bySymbol = new Map<string, SnapshotProtocol>();
+  for (const p of snapshot.protocols) {
+    if (p.mcap_usd === null || p.mcap_usd <= 0 || p.tvl_usd <= 0 || p.category === 'CEX') continue;
+    const key = (p.symbol ?? p.slug).toLowerCase();
+    const prev = bySymbol.get(key);
+    if (prev === undefined || prev.tvl_usd < p.tvl_usd) bySymbol.set(key, p);
+  }
+  return [...bySymbol.values()];
 }
 
-/** The comps table: the global median ratio and one median per category. */
-export interface CompsTable {
-  global_median: number;
-  global_count: number;
-  by_category: Map<string, CompsCategory>;
-}
-
-export function buildCompsTable(live: SnapshotProtocol[], model: ModelConstants): CompsTable {
-  const winsor = (r: number): number => Math.min(model.winsor_high, Math.max(model.winsor_low, r));
-  const global_median = median(live.map((p) => winsor(p.mcap_usd! / p.tvl_usd)));
-  const groups = new Map<string, number[]>();
-  for (const p of live) {
-    const key = p.category ?? 'Other';
-    const arr = groups.get(key) ?? [];
-    arr.push(winsor(p.mcap_usd! / p.tvl_usd));
-    groups.set(key, arr);
+/** Least squares for y = a + b x: the intercept, the slope and the R squared in log space. */
+function ols2(xs: number[], ys: number[]): { intercept: number; slope: number; r2: number } {
+  const n = xs.length;
+  let sx = 0, sy = 0, sxx = 0, sxy = 0;
+  for (let i = 0; i < n; i++) { sx += xs[i]!; sy += ys[i]!; sxx += xs[i]! * xs[i]!; sxy += xs[i]! * ys[i]!; }
+  const slope = (n * sxy - sx * sy) / (n * sxx - sx * sx);
+  const intercept = (sy - slope * sx) / n;
+  const mean = sy / n;
+  let ssTot = 0, ssRes = 0;
+  for (let i = 0; i < n; i++) {
+    ssTot += (ys[i]! - mean) ** 2;
+    ssRes += (ys[i]! - (intercept + slope * xs[i]!)) ** 2;
   }
-  const by_category = new Map<string, CompsCategory>();
-  for (const [category, ratios] of groups) {
-    by_category.set(category, { category, median: median(ratios), count: ratios.length });
-  }
-  return { global_median, global_count: live.length, by_category };
+  return { intercept, slope, r2: ssTot > 0 ? 1 - ssRes / ssTot : 0 };
 }
 
 /**
- * The multiple one category is priced at: its own median market-cap / TVL ratio where the
- * category has enough live comps to price the kind, else the global median with the category
- * factor still applied, because a thin category's kind is not priced by its own market yet.
+ * The size curve: least squares of log market cap on log TVL over the live comps, plus one
+ * intercept shift per category with enough live tokens: the median of its live tokens'
+ * log residuals from the curve, shrunk by n/(n+shift_shrink) toward the curve, so a thin
+ * category cannot pull the price far on a few tokens.
  */
-export function multipleFor(
-  category: string | null,
-  table: CompsTable,
-  model: ModelConstants,
-): { multiple: number; source: string; category_multiplier: number; category_factor: string } {
-  const key = category ?? 'Other';
-  const entry = table.by_category.get(key);
-  if (entry !== undefined && entry.count >= model.min_category_comps) {
-    return {
-      multiple: entry.median,
-      source: `${key} median (${entry.count} live)`,
-      category_multiplier: 1,
-      category_factor: 'comps-calibrated',
-    };
+export function buildSizeCurve(live: SnapshotProtocol[], model: ModelConstants): SizeCurve {
+  const xs = live.map((p) => Math.log(p.tvl_usd));
+  const ys = live.map((p) => Math.log(p.mcap_usd!));
+  const { intercept, slope, r2 } = ols2(xs, ys);
+  const residuals = new Map<string, number[]>();
+  for (let i = 0; i < live.length; i++) {
+    const key = live[i]!.category ?? 'Other';
+    const arr = residuals.get(key) ?? [];
+    arr.push(ys[i]! - (intercept + slope * xs[i]!));
+    residuals.set(key, arr);
   }
-  const { factor, label } = categoryFactor(category);
+  const by_category = new Map<string, CompsCategory>();
+  for (const [category, rs] of residuals) {
+    if (rs.length < model.min_category_comps) continue;
+    by_category.set(category, {
+      category,
+      shift: median(rs) * (rs.length / (rs.length + model.shift_shrink)),
+      count: rs.length,
+    });
+  }
+  return { intercept, slope, r2, count: live.length, by_category };
+}
+
+/** The curve's value for one protocol: the fitted market cap before the stated priors. */
+export function sizeCurveValue(protocol: SnapshotProtocol, curve: SizeCurve): { value: number; shift: number; source: string } {
+  const entry = curve.by_category.get(protocol.category ?? 'Other');
+  const shift = entry !== undefined ? entry.shift : 0;
+  const value = Math.exp(curve.intercept + curve.slope * Math.log(protocol.tvl_usd) + shift);
+  const source =
+    entry !== undefined
+      ? `size curve + ${protocol.category} shift (${entry.count} live)`
+      : `size curve (${curve.count} live)`;
+  return { value, shift, source };
+}
+
+/**
+ * The multiple one protocol is priced at: its curve value before the category shift, over its
+ * TVL. The shift stays separate as the category multiplier, so the page's waterfall multiplies
+ * TVL by the curve multiple, then by the shift: the same arithmetic the board writes.
+ * The dashboard's sandbox scales this multiple, and switches the category shift off, from the
+ * same numbers.
+ */
+export function curveMultipleFor(
+  protocol: SnapshotProtocol,
+  curve: SizeCurve,
+): { multiple: number; source: string; category_multiplier: number; category_factor: string; size_value: number; shift: number } {
+  const { value, shift, source } = sizeCurveValue(protocol, curve);
+  const base = Math.exp(curve.intercept + curve.slope * Math.log(protocol.tvl_usd));
   return {
-    multiple: table.global_median,
-    source: `global median (${table.global_count} live)`,
-    category_multiplier: factor,
-    category_factor: label,
+    multiple: base / protocol.tvl_usd,
+    source,
+    category_multiplier: Math.exp(shift),
+    category_factor: shift === 0 ? 'size curve' : 'size curve + category shift',
+    size_value: value,
+    shift,
   };
 }
 
-/** The five factors and the implied value one protocol gets under `model` and `table`. */
+/** The five factors and the implied value one protocol gets under `model` and `curve`. */
 export function impliedValue(
   protocol: SnapshotProtocol,
   asOf: string,
-  table: CompsTable,
+  curve: SizeCurve,
   model: ModelConstants,
 ): {
   implied: number;
@@ -366,6 +402,8 @@ export function impliedValue(
   compsSource: string;
   categoryMult: number;
   categoryLabel: string;
+  sizeValue: number;
+  categoryShift: number;
   age: number | null;
 } {
   const age = ageDays(asOf, protocol.listed_at);
@@ -377,11 +415,8 @@ export function impliedValue(
     model.maturity_floor +
     (Math.min(Math.max(ageForModel, 0), model.maturity_days) / model.maturity_days) * model.maturity_range;
   const chainMult = chainMultiplier(protocol.chains, model);
-  const m = multipleFor(protocol.category, table, model);
-  const implied = Math.max(
-    1,
-    Math.round(protocol.tvl_usd * m.multiple * growthMult * maturityMult * chainMult * m.category_multiplier),
-  );
+  const m = curveMultipleFor(protocol, curve);
+  const implied = Math.max(1, Math.round(m.size_value * growthMult * maturityMult * chainMult));
   return {
     implied,
     growthPct,
@@ -392,6 +427,8 @@ export function impliedValue(
     compsSource: m.source,
     categoryMult: m.category_multiplier,
     categoryLabel: m.category_factor,
+    sizeValue: m.size_value,
+    categoryShift: m.shift,
     age,
   };
 }
@@ -406,24 +443,20 @@ function slugHash(slug: string): number {
   return (h >>> 0) / 4294967296;
 }
 
-/**
- * The blind check: the live comps are split by slug hash (80% fit, 20% test), the comps curve
- * is fitted on the fit set only, and each test protocol's market cap is predicted from its TVL
- * times the category multiple the fit set gives it. The median absolute error and the share of
- * predictions within twice the true market cap are the check's result.
- */
-export function blindValidation(live: SnapshotProtocol[], model: ModelConstants): BlindValidation {
-  const fit = live.filter((p) => slugHash(p.slug) < 0.8);
-  const test = live.filter((p) => slugHash(p.slug) >= 0.8);
-  const fitTable = buildCompsTable(fit, model);
+/** One out-of-sample check of a curve: fit on `fit`, predict `test`, count the misses. */
+function checkCurve(
+  fit: SnapshotProtocol[],
+  test: SnapshotProtocol[],
+  model: ModelConstants,
+): BlindValidation {
+  const curve = buildSizeCurve(fit, model);
   const errors: number[] = [];
   let within = 0;
   for (const p of test) {
-    const m = multipleFor(p.category, fitTable, model);
-    const predicted = p.tvl_usd * m.multiple * m.category_multiplier;
+    const { value } = sizeCurveValue(p, curve);
     const actual = p.mcap_usd!;
-    errors.push((Math.abs(predicted - actual) / actual) * 100);
-    if (predicted / actual >= 0.5 && predicted / actual <= 2) within++;
+    errors.push((Math.abs(value - actual) / actual) * 100);
+    if (value / actual >= 0.5 && value / actual <= 2) within++;
   }
   return {
     fit_count: fit.length,
@@ -432,6 +465,30 @@ export function blindValidation(live: SnapshotProtocol[], model: ModelConstants)
     within_2x_count: within,
     within_2x_share: test.length > 0 ? within / test.length : 0,
   };
+}
+
+/**
+ * The blind check: the live comps are split by slug hash (80% fit, 20% test), the size curve
+ * is fitted on the fit set only, and each test protocol's market cap is predicted from the
+ * curve. The median absolute error and the share of predictions within twice the true market
+ * cap are the check's result.
+ */
+export function blindValidation(live: SnapshotProtocol[], model: ModelConstants): BlindValidation {
+  const fit = live.filter((p) => slugHash(p.slug) < 0.8);
+  const test = live.filter((p) => slugHash(p.slug) >= 0.8);
+  return checkCurve(fit, test, model);
+}
+
+/**
+ * The walk-forward check: the curve is fitted on the live tokens listed before the model's
+ * time-split cutoff and tested on the ones listed after it — the past pricing the future,
+ * the way a radar's reader would use it.
+ */
+export function timeSplitValidation(live: SnapshotProtocol[], model: ModelConstants): BlindValidation {
+  const cut = Date.parse(`${model.time_split_cutoff}T00:00:00Z`);
+  const fit = live.filter((p) => p.listed_at !== null && Date.parse(`${p.listed_at}T00:00:00Z`) < cut);
+  const test = live.filter((p) => p.listed_at !== null && Date.parse(`${p.listed_at}T00:00:00Z`) >= cut);
+  return checkCurve(fit, test, model);
 }
 
 /** DefiLlama's version-marker rule: a name ending in a release is a pool of another protocol. */
@@ -464,9 +521,9 @@ export interface BoardSummary {
 export function buildBoard(
   snapshot: Snapshot,
   model: ModelConstants = MODEL,
-  table?: CompsTable,
+  curve?: SizeCurve,
 ): BoardRow[] {
-  const comps = table ?? buildCompsTable(liveComps(snapshot), model);
+  const fit = curve ?? buildSizeCurve(liveComps(snapshot), model);
   const index = bySlug(snapshot.protocols);
   const chosen = new Map<string, SnapshotProtocol>();
   // The watchlist is the floor: every slug, even one the snapshot no longer carries (it cannot, but the
@@ -484,7 +541,7 @@ export function buildBoard(
   for (const p of early) chosen.set(p.slug, p);
 
   const scored = [...chosen.values()].map((p) => {
-    const v = impliedValue(p, snapshot.as_of, comps, model);
+    const v = impliedValue(p, snapshot.as_of, fit, model);
     return { p, ...v };
   });
   scored.sort((a, b) => b.implied - a.implied || (a.p.slug < b.p.slug ? -1 : a.p.slug > b.p.slug ? 1 : 0));
@@ -509,19 +566,21 @@ export function buildBoard(
       comps_multiple: s.compsMultiple,
       comps_source: s.compsSource,
       growth_pct: s.growthPct,
-      growth_multiplier: round4(s.growthMult),
-      maturity_multiplier: round4(s.maturityMult),
-      chain_multiplier: round4(s.chainMult),
+      growth_multiplier: s.growthMult,
+      maturity_multiplier: s.maturityMult,
+      chain_multiplier: s.chainMult,
       category_multiplier: s.categoryMult,
       category_factor: s.categoryLabel,
       age_days: s.age,
+      size_curve_value: s.sizeValue,
+      category_shift: s.categoryShift,
     },
+    verdict: verdictFor(s.p, s.implied, s.growthPct, s.age),
+    signals: signalsFor(s.p, s.growthPct, s.age),
     farm_steps: farmSteps(s.p, s.age).map(stepText),
     farm_budget: farmBudget(s.p),
   }));
 }
-
-const round4 = (n: number): number => Math.round(n * 1e4) / 1e4;
 
 /** A step as one string: its action, then its cost and time, within the gate's 20..600 characters. */
 export function stepText(step: FarmStep): string {
@@ -608,8 +667,37 @@ function weeklyFor(p: SnapshotProtocol): string {
 }
 
 /**
- * A protocol's farm plan: six steps, each an action with a cost and a time. The plan is derived from
+ * One protocol's verdict, from its own figures: cooling TVL first, then a large implied value
+ * that is still growing, then a young protocol that needs a long hold, then the steady farm.
+ * A verdict is a reading of the row, never a promise of a token.
+ */
+export function verdictFor(
+  p: SnapshotProtocol,
+  implied: number,
+  growthPct: number,
+  age: number | null,
+): string {
+  if (growthPct <= -15) return 'Cooling — watch before farming';
+  if (implied >= 10_000_000 && growthPct >= 0) return 'Farm now';
+  if (age !== null && age < 180) return 'Early — small size, long hold';
+  return 'Steady farm';
+}
+
+/** A row's signal chips, from its own figures: momentum, age and chain breadth, at most three. */
+export function signalsFor(p: SnapshotProtocol, growthPct: number, age: number | null): string[] {
+  const out: string[] = [];
+  if (growthPct >= 20) out.push('HOT');
+  else if (growthPct <= -20) out.push('COOLING');
+  if (age !== null && age < 180) out.push('NEW');
+  else if (age !== null && age >= 1095) out.push('VETERAN');
+  if (p.chains.length >= 4) out.push('WIDE');
+  return out.slice(0, 3);
+}
+
+/**
+ * A protocol's farm plan: seven steps, each an action with a cost and a time. The plan is derived from
  * the protocol's own record (category, chains, TVL and age), never from a hand-written list of names.
+ * The seventh step is week one, day by day, so the first week has a schedule instead of a slogan.
  */
 export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
   const chain = chainOf(p);
@@ -631,6 +719,11 @@ export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
       text: weeklyFor(p),
       cost: `about ${gas} a week`,
       time: '10 minutes a week',
+    },
+    {
+      text: `Week 1, day by day: day 1 set the position up, day 3 make the first weekly action, day 7 open the points page and write the week in the farm log.`,
+      cost: `about ${gas} across the week`,
+      time: '20 minutes across the week',
     },
     {
       text: `Hold the position for at least ${hold} days so the activity is counted in more than one snapshot.`,
@@ -689,6 +782,10 @@ export function radarRow(row: BoardRow): RadarRow {
     chain_multiplier: row.model.chain_multiplier,
     category_multiplier: row.model.category_multiplier,
     category_factor: row.model.category_factor,
+    size_curve_value: row.model.size_curve_value,
+    category_shift: row.model.category_shift,
+    verdict: row.verdict,
+    signals: row.signals,
     farm_budget: row.farm_budget,
   };
 }
@@ -696,14 +793,20 @@ export function radarRow(row: BoardRow): RadarRow {
 /** Everything the dashboard renders, from the snapshot. */
 export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): { board: BoardRow[]; radar: RadarData } {
   const live = liveComps(snapshot);
-  const table = buildCompsTable(live, model);
+  const curve = buildSizeCurve(live, model);
   const validation = blindValidation(live, model);
-  const board = buildBoard(snapshot, model, table);
+  const validation_time = timeSplitValidation(live, model);
+  const board = buildBoard(snapshot, model, curve);
   const liveList = liveRows(snapshot);
   const early = board.filter((r) => !snapshot.watchlist.includes(r.slug)).length;
-  const comps_categories = [...table.by_category.values()]
-    .filter((c) => c.count >= model.min_category_comps)
-    .sort((a, b) => b.count - a.count || (a.category < b.category ? -1 : a.category > b.category ? 1 : 0));
+  const comps_categories = [...curve.by_category.values()].sort(
+    (a, b) => b.count - a.count || (a.category < b.category ? -1 : a.category > b.category ? 1 : 0),
+  );
+  const curve_table: CurvePoint[] = [10_000_000, 100_000_000, 1_000_000_000, 10_000_000_000].map((tvl_usd) => ({
+    tvl_usd,
+    multiple: Math.exp(curve.intercept + curve.slope * Math.log(tvl_usd)) / tvl_usd,
+  }));
+  const comps_global_median = median(live.map((p) => p.mcap_usd! / p.tvl_usd));
   const radar: RadarData = {
     as_of: snapshot.as_of,
     source: snapshot.source,
@@ -714,10 +817,13 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
     board_size: board.length,
     early_size: early,
     live_size: liveList.length,
-    comps_global_median: table.global_median,
-    comps_live_count: table.global_count,
+    comps_global_median,
+    comps_live_count: live.length,
     comps_categories,
+    curve: { intercept: curve.intercept, slope: curve.slope, r2: curve.r2, count: curve.count },
+    curve_table,
     validation,
+    validation_time,
     rows: board.map(radarRow),
     live: liveList,
   };
